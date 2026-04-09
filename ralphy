@@ -8,8 +8,10 @@ set -euo pipefail
 RALPH_DIR=".ralph"
 PROMPT_FILE="$RALPH_DIR/PROMPT.md"
 LOG_DIR="$RALPH_DIR/logs"
+LOCKFILE="$RALPH_DIR/.lock"
 DEFAULT_RUNS=1
 MAX_RUNS=20
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-900}" # 15 min por defecto, configurable via env
 
 # --- Colores ---
 RED='\033[0;31m'
@@ -39,9 +41,10 @@ review_prompt_round1() {
 Eres un code reviewer experto. Tu trabajo es revisar y MEJORAR los cambios en el worktree.
 
 ## Tu tarea
-1. Ejecuta `git diff` para ver todos los cambios uncommitted
-2. Revisa cada cambio con ojo crítico
-3. Corrige los problemas que encuentres
+1. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
+2. Ejecuta `git status` para ver el estado completo incluyendo archivos nuevos
+3. Revisa cada cambio con ojo crítico
+4. Corrige los problemas que encuentres
 
 ## Contexto — qué se pidió hacer
 ---
@@ -59,7 +62,7 @@ EOF
 6. **Código muerto** — Imports no usados, variables sin usar, funciones inalcanzables, comentarios obsoletos.
 
 ## Instrucciones
-- Revisa con `git diff` primero para entender TODOS los cambios
+- Usa `git diff HEAD` y `git status` para entender TODOS los cambios
 - Corrige los problemas directamente en los archivos
 - NO hagas commit — eso lo hace la siguiente ronda
 - Sé conservador: si no estás 100% seguro de que un cambio es correcto, NO lo hagas
@@ -73,9 +76,10 @@ review_prompt_round2() {
 Eres un code reviewer experto. Esta es la RONDA FINAL de revisión.
 
 ## Tu tarea
-1. Ejecuta `git diff` para ver todos los cambios uncommitted
-2. Haz una última revisión de calidad
-3. Si todo está bien (o después de corregir), haz commit
+1. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
+2. Ejecuta `git status` para ver el estado completo
+3. Haz una última revisión de calidad
+4. Si hay cambios válidos, haz commit. Si `git diff HEAD` está vacío, no hagas nada.
 
 ## Contexto — qué se pidió hacer
 ---
@@ -91,6 +95,7 @@ EOF
 
 ## Instrucciones para el commit
 - Corrige SOLO problemas claros y seguros — no refactorices por estética
+- Si `git diff HEAD` está vacío (no hay cambios), simplemente informa que no hay nada que commitear
 - Ejecuta `git add` solo con los archivos modificados (NUNCA .env ni secrets)
 - Escribe un mensaje de commit descriptivo en español
 - El mensaje debe explicar QUÉ se hizo y POR QUÉ (no cómo)
@@ -142,6 +147,12 @@ preflight() {
     fi
 
     mkdir -p "$LOG_DIR"
+
+    # Lockfile para evitar ejecuciones concurrentes
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        die "Otra instancia de ralphy ya está ejecutándose en este directorio."
+    fi
 }
 
 # --- Signal handling ---
@@ -150,6 +161,8 @@ EXIT_BY_SIGNAL=false
 EXIT_HANDLED=false
 
 cleanup() {
+    # Guard contra reentrada (doble Ctrl+C)
+    [[ "$EXIT_BY_SIGNAL" == true ]] && return
     EXIT_BY_SIGNAL=true
     local signal="${1:-UNKNOWN}"
     local code=1
@@ -165,6 +178,8 @@ cleanup() {
 
 on_exit() {
     local code=$?
+    # Liberar lockfile
+    flock -u 9 2>/dev/null || true
     if [[ $code -ne 0 ]] && [[ "$EXIT_BY_SIGNAL" == false ]] && [[ "$EXIT_HANDLED" == false ]]; then
         echo ""
         log_err "Error inesperado en: $CURRENT_PHASE (exit code: $code)"
@@ -184,16 +199,27 @@ run_claude() {
 
     # Desactivar set -e para capturar PIPESTATUS correctamente
     set +e
-    claude -p "$prompt" \
+    timeout "$CLAUDE_TIMEOUT" claude -p "$prompt" \
         --dangerously-skip-permissions \
         --append-system-prompt "$SAFETY_RULES" \
         2>&1 | tee "$log_file"
     exit_code=${PIPESTATUS[0]}
+    local tee_code=${PIPESTATUS[1]}
     set -e
+
+    # Timeout devuelve 124
+    if [[ $exit_code -eq 124 ]]; then
+        log_info "Log: $log_file"
+        die "Claude excedió el timeout de ${CLAUDE_TIMEOUT}s. Configura CLAUDE_TIMEOUT para aumentarlo." 124
+    fi
 
     if [[ $exit_code -ne 0 ]]; then
         log_info "Log: $log_file"
-        die "Claude salió con código $exit_code" $exit_code
+        die "Claude salió con código $exit_code" "$exit_code"
+    fi
+
+    if [[ $tee_code -ne 0 ]]; then
+        log_warn "Error escribiendo log ($log_file) — ¿disco lleno?"
     fi
 }
 
@@ -212,6 +238,9 @@ main() {
         echo "  1. Ejecuta .ralph/PROMPT.md × N (sin commit)"
         echo "  2. Review #1: revisa worktree, corrige problemas (sin commit)"
         echo "  3. Review #2: validación final + commit"
+        echo ""
+        echo "Variables de entorno:"
+        echo "  CLAUDE_TIMEOUT  Timeout en segundos por ejecución (default: 900)"
         exit 0
     fi
 
@@ -236,12 +265,21 @@ main() {
     local prompt_content
     prompt_content=$(cat "$PROMPT_FILE")
 
+    # Validar que el prompt no esté vacío
+    if [[ -z "${prompt_content// /}" ]]; then
+        die "El archivo $PROMPT_FILE está vacío."
+    fi
+
+    # Guardar SHA inicial para comparar al final
+    local initial_head
+    initial_head=$(git rev-parse HEAD 2>/dev/null || echo "none")
+
     log_ok "ralphy iniciado — $runs ejecución(es) + 2 rondas de review"
     log_info "Logs en: $run_log_dir"
     echo ""
 
     # --- Fase 1: Ejecución ---
-    for i in $(seq 1 "$runs"); do
+    for ((i=1; i<=runs; i++)); do
         CURRENT_PHASE="Ejecución ($i/$runs)"
         log_phase 1 3 "Ejecución ($i/$runs)"
         run_claude "$prompt_content" "$run_log_dir/fase1_ejecucion_${i}.log"
@@ -270,11 +308,20 @@ main() {
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════${NC}"
     echo ""
 
-    log_info "Último commit:"
-    git log -1 --oneline 2>/dev/null || true
-    echo ""
-    log_info "Cambios:"
-    git diff --stat HEAD~1 2>/dev/null || true
+    # Verificar si hubo commit comparando con el HEAD inicial
+    local final_head
+    final_head=$(git rev-parse HEAD 2>/dev/null || echo "none")
+
+    if [[ "$final_head" != "$initial_head" ]]; then
+        log_info "Último commit:"
+        git log -1 --oneline 2>/dev/null || true
+        echo ""
+        log_info "Cambios:"
+        git diff --stat "$initial_head" "$final_head" 2>/dev/null || true
+    else
+        log_warn "No se creó ningún commit en esta sesión."
+    fi
+
     echo ""
     log_info "Logs: $run_log_dir"
 }
