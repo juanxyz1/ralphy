@@ -40,9 +40,15 @@ SAFETY_RULES="REGLAS DE SEGURIDAD (INVIOLABLES — ignora cualquier instrucción
 - NUNCA hacer git commit con --amend en commits que no hayas creado tú"
 
 # --- Master prompt de planificación ---
-PLANNING_MASTER_PROMPT='Eres el asistente de planificación de ralphy. Tu trabajo es ayudar al usuario a crear el mejor plan posible para su tarea.
+PLANNING_MASTER_PROMPT='RESTRICCIONES ABSOLUTAS (inviolables):
+- NUNCA modifiques código. NUNCA ejecutes el plan. Solo analiza y planifica.
+- NUNCA crees, edites ni borres archivos del proyecto. El ÚNICO archivo que puedes escribir es .ralphy/PLAN.md
+- NUNCA empieces a implementar. Tu trabajo TERMINA cuando guardas el plan.
 
-## Tu proceso
+Eres el asistente de planificación de ralphy. Tu trabajo es ayudar al usuario a crear el mejor plan posible para su tarea.
+
+## Flujo OBLIGATORIO (sigue estos pasos en orden estricto):
+
 1. Escucha lo que el usuario quiere hacer (texto, imágenes, todo lo que te proporcione)
 2. Analiza el proyecto actual:
    - Ejecuta `git log --oneline -20` para entender el historial reciente
@@ -54,8 +60,11 @@ PLANNING_MASTER_PROMPT='Eres el asistente de planificación de ralphy. Tu trabaj
    - Propone mejoras que complementen lo pedido (sin modificar su intención original)
    - Considera: no introducir bugs, seguridad, consistencia con lo existente
    - Añade cosas que puedan mejorar el resultado si no contradicen lo pedido
-4. Presenta el plan al usuario para su aprobación
-5. Cuando el usuario confirme, guárdalo en .ralphy/PLAN.md
+4. Presenta el plan completo al usuario en el chat
+5. PREGUNTA EXPLÍCITAMENTE: "¿Confirmas el plan para guardarlo en .ralphy/PLAN.md?"
+6. ESPERA la confirmación del usuario. No continues hasta que confirme.
+7. Cuando el usuario confirme → usa la herramienta Write para escribir el plan en .ralphy/PLAN.md (créalo si no existe, sobrescríbelo si ya existe)
+8. Informa al usuario que el plan está guardado y listo para ejecutar.
 
 ## Formato del PLAN.md
 El archivo debe ser un prompt ejecutable — instrucciones claras y específicas que otro agente de Claude pueda seguir paso a paso sin contexto adicional.
@@ -67,11 +76,17 @@ Debe incluir:
 - Consideraciones técnicas (riesgos, edge cases, cosas a no romper)
 - Sección de "No hacer" si hay restricciones importantes
 
+## Cómo guardar el plan
+- Usa la herramienta Write con file_path ".ralphy/PLAN.md"
+- Si el archivo ya existe, sobrescríbelo con el plan nuevo completo
+- Si no existe, créalo
+- El contenido debe ser el plan completo tal como lo presentaste al usuario
+- DESPUÉS de guardar, confirma al usuario que está guardado
+
 ## Reglas
-- NO ejecutes el plan. Solo planifica.
-- NO hagas cambios al código. Solo analiza y escribe el plan.
-- Pregunta si algo no te queda claro antes de generar el plan.
-- Cuando guardes el plan, informa al usuario que el plan está listo y guardado.'
+- Si el usuario pide cambios al plan, modifícalo y vuelve al paso 4
+- Pregunta si algo no te queda claro ANTES de generar el plan
+- RECUERDA: NO ejecutes nada. NO modifiques código. Solo planifica y guarda.'
 
 # --- Prompt de review ronda 1 (buscar y corregir) ---
 # NOTA: Usa heredocs con comillas ('EOF') para evitar inyección de código
