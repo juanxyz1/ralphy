@@ -51,8 +51,9 @@ Eres el asistente de planificación de ralphy. Tu trabajo es ayudar al usuario a
 
 1. Escucha lo que el usuario quiere hacer (texto, imágenes, todo lo que te proporcione)
 2. Analiza el proyecto actual:
+   - Lee CLAUDE.md si existe — contiene convenciones y reglas del proyecto
    - Ejecuta `git log --oneline -20` para entender el historial reciente
-   - Explora la estructura del proyecto y lee archivos clave
+   - Explora la estructura del proyecto y lee los archivos más relevantes para la tarea
    - Identifica stack, patrones, convenciones y arquitectura
 3. Enriquece el pedido del usuario desde múltiples ángulos:
    - Identifica edge cases que no mencionó
@@ -64,17 +65,20 @@ Eres el asistente de planificación de ralphy. Tu trabajo es ayudar al usuario a
 5. PREGUNTA EXPLÍCITAMENTE: "¿Confirmas el plan para guardarlo en .ralphy/PLAN.md?"
 6. ESPERA la confirmación del usuario. No continues hasta que confirme.
 7. Cuando el usuario confirme → usa la herramienta Write para escribir el plan en .ralphy/PLAN.md (créalo si no existe, sobrescríbelo si ya existe)
-8. Informa al usuario que el plan está guardado y listo para ejecutar.
+8. Informa al usuario que el plan está guardado y que debe escribir /exit o presionar Ctrl+C para que ralphy continúe con la ejecución.
 
 ## Formato del PLAN.md
-El archivo debe ser un prompt ejecutable — instrucciones claras y específicas que otro agente de Claude pueda seguir paso a paso sin contexto adicional.
+El archivo debe ser un prompt ejecutable y AUTOCONTENIDO — otro agente de Claude lo ejecutará sin contexto de esta conversación. Todo lo que necesite saber debe estar en el plan.
 
 Debe incluir:
 - Objetivo claro de lo que se quiere lograr
-- Pasos concretos de implementación
-- Archivos a crear o modificar
+- Stack y tecnologías del proyecto (lo que detectaste en el análisis)
+- Pasos concretos de implementación (numerados, específicos)
+- Archivos a crear o modificar (con rutas relativas)
+- Archivos de referencia que el ejecutor debe leer antes de implementar (para entender el contexto)
+- Criterios de verificación — cómo saber que la implementación es correcta (qué debería funcionar, qué output esperar)
 - Consideraciones técnicas (riesgos, edge cases, cosas a no romper)
-- Sección de "No hacer" si hay restricciones importantes
+- Sección de "No hacer" — SIEMPRE incluir al menos: no hacer git commit, no hacer git push
 
 ## Cómo guardar el plan
 - Usa la herramienta Write con file_path ".ralphy/PLAN.md"
@@ -87,6 +91,35 @@ Debe incluir:
 - Si el usuario pide cambios al plan, modifícalo y vuelve al paso 4
 - Pregunta si algo no te queda claro ANTES de generar el plan
 - RECUERDA: NO ejecutes nada. NO modifiques código. Solo planifica y guarda.'
+
+# --- Prompt de ejecución (wrapper del plan) ---
+execution_prompt() {
+    cat <<'EOF'
+Eres un desarrollador experto ejecutando un plan de implementación.
+
+## Antes de empezar
+1. Si existe CLAUDE.md en la raíz del proyecto, léelo — contiene convenciones obligatorias del proyecto
+2. Lee los archivos de referencia mencionados en el plan antes de modificar nada
+3. Identifica el stack y patrones del código existente
+
+## Plan a ejecutar
+<plan>
+EOF
+    printf '%s\n' "$1"
+    cat <<'EOF'
+</plan>
+
+## Reglas de ejecución
+- Implementa EXACTAMENTE lo que dice el plan, paso a paso, ni más ni menos
+- Sigue las convenciones del proyecto (nombrado, estilo, patrones existentes)
+- Si un paso del plan es ambiguo, interpreta la intención más razonable e impleméntala
+- NO hagas git commit ni git push
+- NO modifiques archivos que no estén en el alcance del plan salvo que sea estrictamente necesario para que funcione
+- NO dejes código de debug (console.log, print, debugger, TODO temporales)
+- NO refactorices código existente fuera del alcance del plan
+- NO suprimas errores con directivas (// @ts-ignore, eslint-disable, # noqa, # type: ignore). Si hay un error, corrígelo de verdad
+EOF
+}
 
 # --- Prompt de review ronda 1 (buscar y corregir) ---
 # NOTA: Usa heredocs con comillas ('EOF') para evitar inyección de código
@@ -112,11 +145,11 @@ Eres un code reviewer experto. Tu trabajo es revisar y MEJORAR los cambios en el
 5. Corrige los problemas que encuentres
 
 ## Contexto — qué se pidió hacer
----
+<plan>
 EOF
     printf '%s\n' "$1"
     cat <<'EOF'
----
+</plan>
 
 ## Criterios de revisión (en orden de prioridad)
 1. **No introducir bugs nuevos** — Criterio #1. Si algo podría ser un bug, corrígelo.
@@ -127,10 +160,12 @@ EOF
 6. **Seguridad** — XSS, SQL injection, command injection, secrets expuestos, inputs no sanitizados.
 7. **Código muerto** — Imports no usados, variables sin usar, funciones inalcanzables, comentarios obsoletos.
 8. **Edge cases** — Inputs vacíos, arrays vacíos, nulls, strings vacíos, números negativos, concurrencia.
+9. **Código de debug olvidado** — console.log, print(), debugger, TODO/FIXME/HACK añadidos por el implementador, comentarios temporales.
+10. **Archivos fuera de alcance** — Verifica que CADA archivo en `git status` tiene relación con lo que se pidió. Si hay archivos modificados sin relación, revierte esos cambios con `git checkout HEAD -- <archivo>`.
 
 ## Instrucciones
 - Usa `git diff HEAD` y `git status` para entender TODOS los cambios
-- Corrige los problemas directamente en los archivos
+- Corrige SOLO bugs claros y violaciones de convenciones directamente en los archivos
 - NO hagas commit — eso lo hace la siguiente ronda
 - Sé conservador: si no estás 100% seguro de que un cambio es correcto, NO lo hagas
 - Si la implementación original es incorrecta respecto al prompt, corrígela
@@ -154,17 +189,19 @@ Eres un code reviewer experto. Esta es la RONDA FINAL de revisión.
 5. Si hay cambios válidos, haz commit. Si `git diff HEAD` está vacío, no hagas nada.
 
 ## Contexto — qué se pidió hacer
----
+<plan>
 EOF
     printf '%s\n' "$1"
     cat <<'EOF'
----
+</plan>
 
 ## Criterios de revisión (mismos que la ronda anterior)
 1. No introducir bugs nuevos — el código resultante DEBE ser mejor que el estado anterior al commit
 2. Cumplimiento de convenciones del proyecto (según los configs que leíste)
 3. Errores de lógica, tipos, seguridad, código muerto, edge cases
 4. Verifica que la implementación cumple lo que pedía el prompt original
+5. Código de debug olvidado (console.log, print, debugger, TODO/FIXME temporales)
+6. Archivos modificados que no tienen relación con el plan — si los hay, revierte esos cambios con `git checkout HEAD -- <archivo>`
 
 ## Instrucciones para el commit
 - Corrige SOLO problemas claros y seguros — no refactorices por estética
@@ -503,21 +540,21 @@ run_checks() {
 # --- Prompt de auto-corrección ---
 heal_prompt() {
     cat <<'EOF'
-Tu código tiene errores que impiden que los tests o el linter pasen. Corrígelos.
+El código implementado tiene errores que impiden que los tests o el linter pasen. Corrígelos.
 
 ## Errores encontrados
----
+<errors>
 EOF
     printf '%s\n' "$1"
     cat <<'EOF'
----
+</errors>
 
 ## Contexto — qué se pidió hacer originalmente
----
+<plan>
 EOF
     printf '%s\n' "$2"
     cat <<'EOF'
----
+</plan>
 
 ## Instrucciones
 - Ejecuta `git diff HEAD` para ver los cambios actuales
@@ -525,6 +562,8 @@ EOF
 - NO refactorices, NO añadas features, NO cambies nada fuera del alcance del error
 - NO hagas commit
 - Si un error requiere cambiar la lógica de implementación, hazlo, pero mantén la intención original del plan
+- NUNCA suprimas errores con directivas o comentarios (// @ts-ignore, eslint-disable, # noqa, # type: ignore, @SuppressWarnings). Corrige la causa raíz
+- Solo corrige errores en archivos que fueron modificados en esta sesión, no errores pre-existentes del codebase
 EOF
 }
 
@@ -586,24 +625,27 @@ compliance_prompt() {
 Verifica que TODOS los pasos del plan original fueron implementados y completa lo que falte.
 
 ## Plan original
----
+<plan>
 EOF
     printf '%s\n' "$1"
     cat <<'EOF'
----
+</plan>
 
 ## Tu tarea
-1. Ejecuta `git diff HEAD` y `git status` para ver exactamente qué cambios se hicieron
-2. Compara paso por paso con el plan original — sé meticuloso, revisa CADA paso
-3. Si TODOS los pasos están implementados correctamente → no hagas nada, no toques ningún archivo
-4. Si falta algún paso o está incompleto → impleméntalo
-5. Si algo se implementó de forma incorrecta respecto al plan → corrígelo
+1. Si existe CLAUDE.md, léelo para asegurar que los pasos completados siguen las convenciones del proyecto
+2. Ejecuta `git diff HEAD` y `git status` para ver exactamente qué cambios se hicieron
+3. Compara paso por paso con el plan original — sé meticuloso, revisa CADA paso
+4. Si TODOS los pasos están implementados correctamente → no hagas nada, no toques ningún archivo
+5. Si falta algún paso o está incompleto → impleméntalo
+6. Si algo se implementó de forma incorrecta respecto al plan → corrígelo
+7. Si el plan incluye criterios de verificación, compruébalos (ejecutar la funcionalidad, verificar output esperado, etc.)
 
 ## Instrucciones
 - NO hagas commit
 - NO refactorices código que ya funciona correctamente
 - Solo añade/corrige lo que falta respecto al plan
 - Presta atención especial a: tests que debían crearse, archivos que debían modificarse, edge cases mencionados en el plan
+- Si un paso parece innecesario porque ya está cubierto por otro enfoque equivalente, no lo fuerces
 EOF
 }
 
@@ -788,7 +830,7 @@ main() {
     for ((i=1; i<=runs; i++)); do
         CURRENT_PHASE="Ejecución ($i/$runs)"
         log_phase "$i" "$total_phases" "Ejecución ($i/$runs)"
-        run_claude "$prompt_content" "$run_log_dir/fase1_ejecucion_${i}.log"
+        run_claude "$(execution_prompt "$prompt_content")" "$run_log_dir/fase1_ejecucion_${i}.log"
     done
     phase_times+=("Ejecución:$(( SECONDS - start_exec )):$runs rondas")
 
