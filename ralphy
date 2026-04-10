@@ -13,6 +13,10 @@ DEFAULT_RUNS=1
 DEFAULT_REVIEWS=2
 MAX_RUNS=20
 CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-0}" # 0 = sin timeout, configurable via env
+DEFAULT_MAX_HEAL=3
+MAX_HEAL="${RALPHY_MAX_HEAL:-$DEFAULT_MAX_HEAL}"
+SKIP_CHECKS="${RALPHY_SKIP_CHECKS:-0}"
+DEFAULT_MAX_COMPLIANCE=2
 FORCE=false
 
 # --- Colores ---
@@ -77,10 +81,20 @@ review_prompt_round1() {
 Eres un code reviewer experto. Tu trabajo es revisar y MEJORAR los cambios en el worktree.
 
 ## Tu tarea
-1. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
-2. Ejecuta `git status` para ver el estado completo incluyendo archivos nuevos
-3. Revisa cada cambio con ojo crítico
-4. Corrige los problemas que encuentres
+1. **Descubrir convenciones del proyecto** — Lee estos archivos si existen:
+   - CLAUDE.md (instrucciones del proyecto)
+   - .eslintrc, .eslintrc.js, .eslintrc.json, eslint.config.js (reglas de lint JS/TS)
+   - tsconfig.json (configuración TypeScript — ¿strict? ¿paths?)
+   - .prettierrc, prettier.config.js (formato de código)
+   - pyproject.toml, setup.cfg (config Python — ruff, mypy, pytest)
+   - .editorconfig (convenciones de indentación/encoding)
+   - .rubocop.yml, .golangci.yml, clippy.toml (linters específicos del stack)
+   Usa estas convenciones como criterio adicional de revisión.
+
+2. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
+3. Ejecuta `git status` para ver el estado completo incluyendo archivos nuevos
+4. Revisa cada cambio con ojo crítico
+5. Corrige los problemas que encuentres
 
 ## Contexto — qué se pidió hacer
 ---
@@ -92,10 +106,12 @@ EOF
 ## Criterios de revisión (en orden de prioridad)
 1. **No introducir bugs nuevos** — Criterio #1. Si algo podría ser un bug, corrígelo.
 2. **El código debe ser MEJOR que antes** — Si un cambio empeora la calidad, revierte ese cambio específico.
-3. **Errores de lógica** — Condiciones incorrectas, off-by-one, null/undefined no manejados, race conditions.
-4. **Tipos** — Tipos incorrectos, `any` innecesarios, interfaces incompletas, casteos inseguros.
-5. **Seguridad** — XSS, SQL injection, command injection, secrets expuestos, inputs no sanitizados.
-6. **Código muerto** — Imports no usados, variables sin usar, funciones inalcanzables, comentarios obsoletos.
+3. **Cumplimiento de convenciones del proyecto** — Si leíste configs del proyecto, verifica que los cambios las cumplen.
+4. **Errores de lógica** — Condiciones incorrectas, off-by-one, null/undefined no manejados, race conditions.
+5. **Tipos** — Tipos incorrectos, `any` innecesarios, interfaces incompletas, casteos inseguros.
+6. **Seguridad** — XSS, SQL injection, command injection, secrets expuestos, inputs no sanitizados.
+7. **Código muerto** — Imports no usados, variables sin usar, funciones inalcanzables, comentarios obsoletos.
+8. **Edge cases** — Inputs vacíos, arrays vacíos, nulls, strings vacíos, números negativos, concurrencia.
 
 ## Instrucciones
 - Usa `git diff HEAD` y `git status` para entender TODOS los cambios
@@ -112,10 +128,15 @@ review_prompt_round2() {
 Eres un code reviewer experto. Esta es la RONDA FINAL de revisión.
 
 ## Tu tarea
-1. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
-2. Ejecuta `git status` para ver el estado completo
-3. Haz una última revisión de calidad
-4. Si hay cambios válidos, haz commit. Si `git diff HEAD` está vacío, no hagas nada.
+1. **Descubrir convenciones del proyecto** — Lee estos archivos si existen:
+   - CLAUDE.md, .eslintrc*, eslint.config.js, tsconfig.json, .prettierrc
+   - pyproject.toml, .editorconfig, .rubocop.yml, .golangci.yml, clippy.toml
+   Úsalos como criterio de revisión.
+
+2. Ejecuta `git diff HEAD` para ver TODOS los cambios (staged y unstaged)
+3. Ejecuta `git status` para ver el estado completo
+4. Haz una última revisión de calidad
+5. Si hay cambios válidos, haz commit. Si `git diff HEAD` está vacío, no hagas nada.
 
 ## Contexto — qué se pidió hacer
 ---
@@ -126,8 +147,9 @@ EOF
 
 ## Criterios de revisión (mismos que la ronda anterior)
 1. No introducir bugs nuevos — el código resultante DEBE ser mejor que el estado anterior al commit
-2. Errores de lógica, tipos, seguridad, código muerto
-3. Verifica que la implementación cumple lo que pedía el prompt original
+2. Cumplimiento de convenciones del proyecto (según los configs que leíste)
+3. Errores de lógica, tipos, seguridad, código muerto, edge cases
+4. Verifica que la implementación cumple lo que pedía el prompt original
 
 ## Instrucciones para el commit
 - Corrige SOLO problemas claros y seguros — no refactorices por estética
@@ -359,6 +381,245 @@ run_claude() {
     log_ok "Fase completada ($(wc -l < "$log_file") líneas de output)"
 }
 
+# --- Auto-detección de checks (tests/lint) ---
+detect_checks() {
+    # Override manual tiene prioridad
+    if [[ -n "${RALPHY_CHECK_CMD:-}" ]]; then
+        echo "$RALPHY_CHECK_CMD"
+        return
+    fi
+
+    # Archivo de checks del proyecto
+    if [[ -f "$RALPHY_DIR/checks" ]]; then
+        cat "$RALPHY_DIR/checks"
+        return
+    fi
+
+    local checks=()
+
+    # Node.js / package.json
+    if [[ -f "package.json" ]]; then
+        if grep -q '"lint"' package.json 2>/dev/null; then
+            checks+=("npm run lint")
+        fi
+        if grep -q '"typecheck"' package.json 2>/dev/null; then
+            checks+=("npm run typecheck")
+        elif [[ -f "tsconfig.json" ]] && command -v npx &>/dev/null; then
+            checks+=("npx tsc --noEmit")
+        fi
+        if grep -q '"test"' package.json 2>/dev/null; then
+            checks+=("npm test")
+        fi
+    fi
+
+    # Python
+    if [[ -f "pyproject.toml" ]] || [[ -f "setup.py" ]] || [[ -f "setup.cfg" ]]; then
+        if command -v ruff &>/dev/null; then
+            checks+=("ruff check .")
+        elif command -v flake8 &>/dev/null; then
+            checks+=("flake8 .")
+        fi
+        if command -v mypy &>/dev/null && { [[ -f "mypy.ini" ]] || grep -q '\[tool\.mypy\]' pyproject.toml 2>/dev/null; }; then
+            checks+=("mypy .")
+        fi
+        if command -v pytest &>/dev/null; then
+            checks+=("pytest")
+        fi
+    fi
+
+    # Rust
+    if [[ -f "Cargo.toml" ]]; then
+        checks+=("cargo clippy -- -D warnings")
+        checks+=("cargo test")
+    fi
+
+    # Go
+    if [[ -f "go.mod" ]]; then
+        checks+=("go vet ./...")
+        checks+=("go test ./...")
+    fi
+
+    # Makefile (solo si no se detectó nada antes por el stack específico)
+    if [[ ${#checks[@]} -eq 0 ]] && [[ -f "Makefile" ]]; then
+        if grep -q '^lint:' Makefile 2>/dev/null; then
+            checks+=("make lint")
+        fi
+        if grep -q '^test:' Makefile 2>/dev/null; then
+            checks+=("make test")
+        fi
+    fi
+
+    printf '%s\n' "${checks[@]}"
+}
+
+# --- Ejecutar checks ---
+run_checks() {
+    local checks="$1"
+    local errors_file="$2"
+    local all_passed=true
+    local errors=""
+
+    while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
+        log_info "  Ejecutando: ${BOLD}$cmd${NC}"
+        local cmd_output
+        set +e
+        cmd_output=$(eval "$cmd" 2>&1)
+        local cmd_exit=$?
+        set -e
+
+        if [[ $cmd_exit -ne 0 ]]; then
+            all_passed=false
+            errors+="=== FALLÓ: $cmd (exit $cmd_exit) ===\n"
+            errors+="$cmd_output\n\n"
+            log_err "  ✗ $cmd (exit $cmd_exit)"
+        else
+            log_ok "  ✓ $cmd"
+        fi
+    done <<< "$checks"
+
+    if [[ "$all_passed" == false ]]; then
+        printf '%b' "$errors" > "$errors_file"
+        return 1
+    fi
+    return 0
+}
+
+# --- Prompt de auto-corrección ---
+heal_prompt() {
+    cat <<'EOF'
+Tu código tiene errores que impiden que los tests o el linter pasen. Corrígelos.
+
+## Errores encontrados
+---
+EOF
+    printf '%s\n' "$1"
+    cat <<'EOF'
+---
+
+## Contexto — qué se pidió hacer originalmente
+---
+EOF
+    printf '%s\n' "$2"
+    cat <<'EOF'
+---
+
+## Instrucciones
+- Ejecuta `git diff HEAD` para ver los cambios actuales
+- Corrige SOLO los errores reportados arriba
+- NO refactorices, NO añadas features, NO cambies nada fuera del alcance del error
+- NO hagas commit
+- Si un error requiere cambiar la lógica de implementación, hazlo, pero mantén la intención original del plan
+EOF
+}
+
+# --- Self-Healing Loop ---
+run_heal_loop() {
+    local prompt_content="$1"
+    local log_dir="$2"
+    local checks="$3"
+
+    if [[ -z "$checks" ]] || [[ "$SKIP_CHECKS" == "1" ]]; then
+        if [[ "$SKIP_CHECKS" == "1" ]]; then
+            log_info "Checks desactivados (RALPHY_SKIP_CHECKS=1)"
+        else
+            log_info "No se detectaron checks (tests/lint) para este proyecto"
+            log_info "Tip: crea $RALPHY_DIR/checks o usa RALPHY_CHECK_CMD para configurar"
+        fi
+        return 0
+    fi
+
+    log_info "Checks detectados:"
+    while IFS= read -r cmd; do
+        [[ -z "$cmd" ]] && continue
+        log_info "  → $cmd"
+    done <<< "$checks"
+    echo ""
+
+    local errors_file="$log_dir/heal_errors.tmp"
+
+    for ((attempt=1; attempt<=MAX_HEAL; attempt++)); do
+        CURRENT_PHASE="Heal loop (intento $attempt/$MAX_HEAL)"
+        log_info "Ejecutando checks (intento $attempt/$MAX_HEAL)..."
+
+        if run_checks "$checks" "$errors_file"; then
+            log_ok "Todos los checks pasaron ✓"
+            rm -f "$errors_file"
+            return 0
+        fi
+
+        if [[ $attempt -eq $MAX_HEAL ]]; then
+            log_err "Los checks siguen fallando después de $MAX_HEAL intentos"
+            log_err "Últimos errores:"
+            cat "$errors_file" >&2
+            rm -f "$errors_file"
+            log_warn "Continuando con review a pesar de los errores..."
+            return 1
+        fi
+
+        log_warn "Checks fallaron — alimentando errores a Claude para corrección..."
+        local error_content
+        error_content=$(cat "$errors_file")
+        run_claude "$(heal_prompt "$error_content" "$prompt_content")" \
+            "$log_dir/heal_attempt_${attempt}.log"
+    done
+}
+
+# --- Prompt de compliance check ---
+compliance_prompt() {
+    cat <<'EOF'
+Verifica que TODOS los pasos del plan original fueron implementados y completa lo que falte.
+
+## Plan original
+---
+EOF
+    printf '%s\n' "$1"
+    cat <<'EOF'
+---
+
+## Tu tarea
+1. Ejecuta `git diff HEAD` y `git status` para ver exactamente qué cambios se hicieron
+2. Compara paso por paso con el plan original — sé meticuloso, revisa CADA paso
+3. Si TODOS los pasos están implementados correctamente → no hagas nada, no toques ningún archivo
+4. Si falta algún paso o está incompleto → impleméntalo
+5. Si algo se implementó de forma incorrecta respecto al plan → corrígelo
+
+## Instrucciones
+- NO hagas commit
+- NO refactorices código que ya funciona correctamente
+- Solo añade/corrige lo que falta respecto al plan
+- Presta atención especial a: tests que debían crearse, archivos que debían modificarse, edge cases mencionados en el plan
+EOF
+}
+
+# --- Compliance check ---
+run_compliance_check() {
+    local prompt_content="$1"
+    local log_dir="$2"
+
+    for ((attempt=1; attempt<=DEFAULT_MAX_COMPLIANCE; attempt++)); do
+        CURRENT_PHASE="Compliance check ($attempt/$DEFAULT_MAX_COMPLIANCE)"
+
+        local pre_diff
+        pre_diff=$(git diff HEAD 2>/dev/null | md5sum)
+
+        log_info "Verificando cumplimiento del plan ($attempt/$DEFAULT_MAX_COMPLIANCE)..."
+        run_claude "$(compliance_prompt "$prompt_content")" \
+            "$log_dir/compliance_${attempt}.log"
+
+        local post_diff
+        post_diff=$(git diff HEAD 2>/dev/null | md5sum)
+
+        # Si no hubo cambios, el plan ya estaba completo
+        if [[ "$pre_diff" == "$post_diff" ]]; then
+            log_ok "Plan completamente implementado ✓"
+            return 0
+        fi
+
+        log_info "Se completaron pasos faltantes"
+    done
+}
+
 # --- Modo planificación ---
 run_plan_mode() {
     echo ""
@@ -413,11 +674,16 @@ main() {
                 echo "  1. Si no hay plan → abre planificación interactiva"
                 echo "  2. Si hay plan → pregunta si ejecutar o replanificar"
                 echo "  3. Ejecuta .ralphy/PLAN.md x N (sin commit)"
-                echo "  4. Reviews 1..N-1: buscar y corregir (sin commit)"
-                echo "  5. Review N: validación final + commit"
+                echo "  4. Compliance check: verifica que se implementó todo el plan"
+                echo "  5. Self-healing: ejecuta tests/lint, corrige errores en bucle"
+                echo "  6. Reviews 1..N-1: buscar y corregir (sin commit)"
+                echo "  7. Review N: validación final + commit"
                 echo ""
                 echo "Variables de entorno:"
-                echo "  CLAUDE_TIMEOUT  Timeout en segundos por ejecución (default: sin límite)"
+                echo "  CLAUDE_TIMEOUT      Timeout en segundos por ejecución (default: sin límite)"
+                echo "  RALPHY_CHECK_CMD    Comando(s) de check, uno por línea (override auto-detección)"
+                echo "  RALPHY_MAX_HEAL     Máx intentos de auto-corrección (default: 3)"
+                echo "  RALPHY_SKIP_CHECKS  Poner a 1 para saltar checks"
                 exit 0
                 ;;
             -f|--force)
@@ -516,6 +782,22 @@ main() {
         log_warn "No se detectaron cambios después de la ejecución. Nada que revisar."
         exit 0
     fi
+
+    # --- Fase: Compliance check ---
+    local start_compliance=$SECONDS
+    echo ""
+    log_info "${BOLD}── Compliance check ──${NC}"
+    run_compliance_check "$prompt_content" "$run_log_dir"
+    phase_times+=("Compliance:$(( SECONDS - start_compliance ))")
+
+    # --- Fase: Self-Healing Loop ---
+    local checks
+    checks=$(detect_checks)
+    local start_heal=$SECONDS
+    echo ""
+    log_info "${BOLD}── Self-Healing Loop ──${NC}"
+    run_heal_loop "$prompt_content" "$run_log_dir" "$checks"
+    phase_times+=("Heal loop:$(( SECONDS - start_heal ))")
 
     # --- Fases: Reviews ---
     for ((r=1; r<=reviews; r++)); do
